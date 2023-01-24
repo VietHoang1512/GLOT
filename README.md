@@ -1,8 +1,7 @@
 # Global-Local Regularization Via Distributional Robustness
 This repository contains the Pytorch implementation of [Global-Local Regularization Via Distributional Robustness](https://arxiv.org/abs/2203.00553). 
 
-
-![Framework](GLOT.png)
+<a href="url"><img src="GLOT.png" align="center" height="600" width="1000" ></a>
 
 If you find our code useful in your research, please cite:
 
