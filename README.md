@@ -1,4 +1,21 @@
-## This is the code for my graduation thesis.
+# Global-Local Regularization Via Distributional Robustness
+This repository contains the Pytorch implementation of [Global-Local Regularization Via Distributional Robustness](https://arxiv.org/abs/2203.00553). 
+
+
+![Framework](GLOT.png)
+
+If you find our code useful in your research, please cite:
+
+```
+@article{phan2022global,
+  title={Global-Local Regularization Via Distributional Robustness},
+  author={Phan, Hoang and Le, Trung and Phung, Trung and Bui, Tuan Anh and Ho, Nhat and Phung, Dinh},
+  journal={International Conference on Artificial Intelligence and Statistics (AISTATS), 2023},
+  year={2022}
+}
+```
+
+
 
 ### Our implementation consists of 4 subexperiments:
 - [Domain adaptation](da-code)
