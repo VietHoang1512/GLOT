@@ -1,85 +1,31 @@
 import os
-import yaml
-import numpy as np
-from scipy.misc import imresize
-import h5py
-from tqdm import tqdm
 import torch
 import torch.nn as nn
 import torch.utils.model_zoo as model_zoo
+from torchvision.models import AlexNet
 from torch.autograd import Variable
 from torch.optim import lr_scheduler
-from torchvision import transforms
 
+
+import h5py
+import numpy as np
+from scipy.misc import imresize
 from common.utils import *
-from models.alexnet import alexnet
-
-
-class RBF(nn.Module):
-    def __init__(self, n, sigma=None):
-        super(RBF, self).__init__()
-
-        self.n = n
-        self.sigma = sigma
-
-    def forward(self, X, Y):
-        XX = X.matmul(X.t())
-        XY = X.matmul(Y.t())
-        YY = Y.matmul(Y.t())
-
-        dnorm2 = -2 * XY + XX.diag().unsqueeze(1) + YY.diag().unsqueeze(0)
-
-        if self.sigma is None:
-            # np_dnorm2 = dnorm2.detach().cpu().numpy()
-            h = torch.median(dnorm2.detach()) / (
-                2 * torch.log(torch.tensor(X.size(0)) + 1.0)
-            )
-            sigma = torch.sqrt(h) * 0.001
-        else:
-            sigma = self.sigma
-        gamma = 1.0 / (1e-8 + 2 * sigma ** 2)
-        K_XY = (-gamma * dnorm2).exp()
-
-        return K_XY
-
-
-class Denormalise(transforms.Normalize):
-    """
-    Undoes the normalization and returns the reconstructed images in the input domain.
-    """
-
-    def __init__(self, mean, std):
-        mean = torch.as_tensor(mean)
-        std = torch.as_tensor(std)
-        std_inv = 1 / (std + 1e-12)
-        mean_inv = -mean * std_inv
-        super(Denormalise, self).__init__(mean=mean_inv, std=std_inv)
-
-    def __call__(self, tensor):
-        return super(Denormalise, self).__call__(tensor.clone())
 
 
 class BatchImageGenerator:
-    def __init__(self, flags, stage, data_paths, b_unfold_label):
+    def __init__(self, flags, stage, file_path, b_unfold_label):
 
-        if stage not in ["train", "test"]:
-            assert ValueError("invalid stage!")
+        if stage not in ['train', 'val', 'test']:
+            assert ValueError('invalid stage!')
 
-        self.configuration(flags, stage, data_paths)
-        for i, path in enumerate(data_paths):
-            if i == 0:
-                self.images, self.labels = self.load_data(path, b_unfold_label)
-            else:
-                images, labels = self.load_data(path, b_unfold_label)
-                self.images = np.append(self.images, images, axis=0)
-                self.labels = np.append(self.labels, labels, axis=0)
-        self.file_num_train = len(self.labels)
-        print("Total num loaded:", self.file_num_train)
+        self.configuration(flags, stage, file_path)
+        self.load_data(b_unfold_label)
 
-    def configuration(self, flags, stage, data_paths):
+    def configuration(self, flags, stage, file_path):
         self.batch_size = flags.batch_size
         self.current_index = -1
-        self.data_paths = data_paths
+        self.file_path = file_path
         self.stage = stage
 
     def normalize(self, inputs):
@@ -108,52 +54,40 @@ class BatchImageGenerator:
 
         return inputs_norm
 
-    def load_data(self, data_path, b_unfold_label):
-        def img_resize(x):
-            x = x[
-                :, :, [2, 1, 0]
-            ]  # we use the pre-read hdf5 data file from the download page and need to change BRG to RGB
+    def load_data(self, b_unfold_label):
+        file_path = self.file_path
+        f = h5py.File(file_path, "r")
+        self.images = np.array(f['images'])
+        self.labels = np.array(f['labels'])
+        f.close()
+
+        def resize(x):
+            x = x[:, :,
+                  [2, 1, 0]]  # we use the pre-read hdf5 data file from the download page and need to change BRG to RGB
             return imresize(x, (224, 224, 3))
 
-        if self.stage is "train":
-            f = h5py.File(data_path + "_train.hdf5", "r")
-            images = np.array(f["images"])
-            labels = np.array(f["labels"])
-            f.close()
-            # f = h5py.File(data_path + "_val.hdf5", "r")
-            # images = np.append(images, np.array(f['images']), 0)
-            # labels = np.append(labels, np.array(f['labels']), 0)
-            # f.close()
-        else:
-            f = h5py.File(data_path + "_test.hdf5", "r")
-            images = np.array(f["images"])
-            labels = np.array(f["labels"])
-            f.close()
-
-        # N = 1000
-        # images = images[:N]
-        # labels = labels[:N]
-
         # resize the image to 224 for the pretrained model
-        images = np.array(list(map(img_resize, images)))
+        self.images = np.array(list(map(resize, self.images)))
 
         # norm the image value
-        images = self.normalize(images)
+        self.images = self.normalize(self.images)
 
-        assert np.max(images) < 5.0 and np.min(images) > -5.0
+        assert np.max(self.images) < 5.0 and np.min(self.images) > -5.0
 
         # shift the labels to start from 0
-        labels -= np.min(labels)
+        self.labels -= np.min(self.labels)
 
         if b_unfold_label:
-            labels = unfold_label(labels=labels, classes=len(np.unique(labels)))
-        assert len(images) == len(labels)
+            self.labels = unfold_label(
+                labels=self.labels, classes=len(np.unique(self.labels)))
+        assert len(self.images) == len(self.labels)
 
-        print("Loaded", len(labels), "samples from", data_path)
+        self.file_num_train = len(self.labels)
+        print('data num loaded:', self.file_num_train)
 
-        if self.stage is "train":
-            images, labels = shuffle_data(samples=images, labels=labels)
-        return images, labels
+        if self.stage is 'train':
+            self.images, self.labels = shuffle_data(
+                samples=self.images, labels=self.labels)
 
     def get_images_labels_batch(self):
 
@@ -167,8 +101,7 @@ class BatchImageGenerator:
                 self.current_index %= self.file_num_train
 
                 self.images, self.labels = shuffle_data(
-                    samples=self.images, labels=self.labels
-                )
+                    samples=self.images, labels=self.labels)
 
             images.append(self.images[self.current_index])
             labels.append(self.labels[self.current_index])
@@ -178,16 +111,28 @@ class BatchImageGenerator:
 
         return images, labels
 
-    def shuffle(self):
-        self.file_num_train = len(self.labels)
-        self.current_index = 0
-        self.images, self.labels = shuffle_data(samples=self.images, labels=self.labels)
+
+def alexnet(num_classes,  pretrained=True):
+    """AlexNet model architecture from the
+    `"One weird trick..." <https://arxiv.org/abs/1404.5997>`_ paper.
+    Args:
+        pretrained (bool): If True, returns a model pre-trained on ImageNet
+    """
+    model = AlexNet()
+    if pretrained:
+        model.load_state_dict(model_zoo.load_url('https://download.pytorch.org/models/alexnet-owt-4df8aa71.pth'))
+        print('Load pre trained model')
+    num_ftrs = model.classifier[-1].in_features
+    model.classifier[-1] = nn.Linear(num_ftrs, num_classes)
+    nn.init.xavier_uniform_(model.classifier[-1].weight, .1)
+    nn.init.constant_(model.classifier[-1].bias, 0.)
+    return model
 
 
-class ModelBaseline:
+class ModelAggregate:
     def __init__(self, flags):
 
-        torch.set_default_tensor_type("torch.cuda.FloatTensor")
+        torch.set_default_tensor_type('torch.cuda.FloatTensor')
 
         self.setup(flags)
         self.setup_path(flags)
@@ -195,60 +140,80 @@ class ModelBaseline:
 
     def setup(self, flags):
         torch.backends.cudnn.deterministic = flags.deterministic
-        print("torch.backends.cudnn.deterministic:", torch.backends.cudnn.deterministic)
+        print('torch.backends.cudnn.deterministic:',
+              torch.backends.cudnn.deterministic)
         fix_all_seed(flags.seed)
 
-        self.network = alexnet(num_classes=flags.num_classes)
+        self.network = alexnet(num_classes=flags.num_classes, pretrained=True)
         self.network = self.network.cuda()
 
         print(self.network)
-        print("flags:", flags)
+        print('flags:', flags)
         if not os.path.exists(flags.logs):
             os.makedirs(flags.logs)
 
-        flags_log = os.path.join(flags.logs, "flags_log.txt")
+        flags_log = os.path.join(flags.logs, 'flags_log.txt')
         write_log(flags, flags_log)
-        with open(os.path.join(flags.logs, "config.yaml"), "w") as outfile:
-            yaml.dump(vars(flags), outfile, default_flow_style=False)
+
         self.load_state_dict(flags, self.network)
 
     def setup_path(self, flags):
 
         root_folder = flags.data_root
-        train_data = ["art_painting", "cartoon", "photo", "sketch"]
-        del train_data[flags.unseen_index]
+        train_data = ['art_painting_train.hdf5',
+                      'cartoon_train.hdf5',
+                      'photo_train.hdf5',
+                      'sketch_train.hdf5']
 
-        test_data = ["art_painting", "cartoon", "photo", "sketch"]
+        val_data = ['art_painting_val.hdf5',
+                    'cartoon_val.hdf5',
+                    'photo_val.hdf5',
+                    'sketch_val.hdf5']
 
-        self.train_data_paths = []
+        test_data = ['art_painting_test.hdf5',
+                     'cartoon_test.hdf5',
+                     'photo_test.hdf5',
+                     'sketch_test.hdf5']
+
+        self.train_paths = []
         for data in train_data:
-            data_path = os.path.join(root_folder, data)
-            self.train_data_paths.append(data_path)
+            path = os.path.join(root_folder, data)
+            self.train_paths.append(path)
+
+        self.val_paths = []
+        for data in val_data:
+            path = os.path.join(root_folder, data)
+            self.val_paths.append(path)
 
         unseen_index = flags.unseen_index
 
-        self.unseen_data_path = os.path.join(root_folder, test_data[unseen_index])
+        self.unseen_data_path = os.path.join(
+            root_folder, test_data[unseen_index])
+        self.train_paths.remove(self.train_paths[unseen_index])
+        self.val_paths.remove(self.val_paths[unseen_index])
 
         if not os.path.exists(flags.logs):
             os.makedirs(flags.logs)
 
-        flags_log = os.path.join(flags.logs, "path_log.txt")
-        write_log(str(self.train_data_paths), flags_log)
+        flags_log = os.path.join(flags.logs, 'path_log.txt')
+        write_log(str(self.train_paths), flags_log)
+        write_log(str(self.val_paths), flags_log)
         write_log(str(self.unseen_data_path), flags_log)
 
-        self.batImageGenTrain = BatchImageGenerator(
-            flags=flags,
-            data_paths=self.train_data_paths,
-            stage="train",
-            b_unfold_label=False,
-        )
+        self.batImageGenTrains = []
+        for train_path in self.train_paths:
+            batImageGenTrain = BatchImageGenerator(flags=flags, file_path=train_path, stage='train',
+                                                   b_unfold_label=False)
+            self.batImageGenTrains.append(batImageGenTrain)
 
-        self.batImageGenTest = BatchImageGenerator(
-            flags=flags,
-            data_paths=[self.unseen_data_path],
-            stage="test",
-            b_unfold_label=False,
-        )
+        self.batImageGenVals = []
+        for val_path in self.val_paths:
+            batImageGenVal = BatchImageGenerator(flags=flags, file_path=val_path, stage='val',
+                                                 b_unfold_label=False)
+            self.batImageGenVals.append(batImageGenVal)
+
+        self.batImageGenTest = BatchImageGenerator(flags=flags, file_path=self.unseen_data_path, stage='test',
+                                                   b_unfold_label=False)
 
     def load_state_dict(self, flags, nn):
 
@@ -256,8 +221,8 @@ class ModelBaseline:
 
             try:
                 tmp = torch.load(flags.state_dict)
-                if "state" in tmp.keys():
-                    pretrained_dict = tmp["state"]
+                if 'state' in tmp.keys():
+                    pretrained_dict = tmp['state']
                 else:
                     pretrained_dict = tmp
             except:
@@ -266,24 +231,13 @@ class ModelBaseline:
             model_dict = nn.state_dict()
 
             # 1. filter out unnecessary keys
-            pretrained_dict = {
-                k: v
-                for k, v in pretrained_dict.items()
-                if k in model_dict and v.size() == model_dict[k].size()
-            }
+            pretrained_dict = {k: v for k, v in pretrained_dict.items() if
+                               k in model_dict and v.size() == model_dict[k].size()}
 
-            print(
-                "model dict keys:",
-                len(model_dict.keys()),
-                "pretrained keys:",
-                len(pretrained_dict.keys()),
-            )
-            print(
-                "model dict keys:",
-                model_dict.keys(),
-                "pretrained keys:",
-                pretrained_dict.keys(),
-            )
+            print('model dict keys:', len(model_dict.keys()),
+                  'pretrained keys:', len(pretrained_dict.keys()))
+            print('model dict keys:', model_dict.keys(),
+                  'pretrained keys:', pretrained_dict.keys())
             # 2. overwrite entries in the existing state dict
             model_dict.update(pretrained_dict)
             # 3. load the new state dict
@@ -294,25 +248,19 @@ class ModelBaseline:
         for name, para in self.network.named_parameters():
             print(name, para.size())
 
-        self.optimizer = sgd(
-            parameters=self.network.parameters(),
-            lr=flags.lr,
-            weight_decay=flags.weight_decay,
-            momentum=flags.momentum,
-        )
+        self.optimizer = sgd(parameters=self.network.parameters(),
+                             lr=flags.lr,
+                             weight_decay=flags.weight_decay,
+                             momentum=flags.momentum)
 
         self.scheduler = lr_scheduler.StepLR(
-            optimizer=self.optimizer, step_size=flags.step_size, gamma=0.1
-        )
-        # self.scheduler = lr_scheduler.CosineAnnealingLR(
-        #     self.optimizer, flags.step_size
-        # )
-        self.loss_fn = torch.nn.CrossEntropyLoss()
+            optimizer=self.optimizer, step_size=flags.step_size, gamma=0.1)
+        self.loss_fn = torch.nn.cross_entropy_loss()
 
     def train(self, flags):
         self.network.train()
-        # self.network.bn_eval()
-        self.best_accuracy = -1
+        self.network.bn_eval()
+        self.best_accuracy_val = -1
 
         for ite in range(flags.loops_train):
 
@@ -320,26 +268,25 @@ class ModelBaseline:
 
             # get the inputs and labels from the data reader
             total_loss = 0.0
+            for index in range(len(self.batImageGenTrains)):
+                images_train, labels_train = self.batImageGenTrains[index].get_images_labels_batch(
+                )
 
-            images_train, labels_train = self.batImageGenTrain.get_images_labels_batch()
+                inputs, labels = torch.from_numpy(
+                    np.array(images_train, dtype=np.float32)), torch.from_numpy(
+                    np.array(labels_train, dtype=np.float32))
 
-            inputs, labels = torch.from_numpy(
-                np.array(images_train, dtype=np.float32)
-            ), torch.from_numpy(np.array(labels_train, dtype=np.float32))
+                # wrap the inputs and labels in Variable
+                inputs, labels = Variable(inputs, requires_grad=False).cuda(), \
+                    Variable(labels, requires_grad=False).long().cuda()
 
-            # wrap the inputs and labels in Variable
-            inputs, labels = (
-                Variable(inputs, requires_grad=False).cuda(),
-                Variable(labels, requires_grad=False).long().cuda(),
-            )
-            # print(inputs)
-            # forward with the adapted parameters
-            outputs, _ = self.network(x=inputs)
+                # forward with the adapted parameters
+                outputs, _ = self.network(x=inputs)
 
-            # loss
-            loss = self.loss_fn(outputs, labels)
+                # loss
+                loss = self.loss_fn(outputs, labels)
 
-            total_loss += loss
+                total_loss += loss
 
             # init the grad to zeros first
             self.optimizer.zero_grad()
@@ -352,43 +299,60 @@ class ModelBaseline:
 
             if ite < 500 or ite % 500 == 0:
                 print(
-                    "ite:",
-                    ite,
-                    "total loss:",
-                    total_loss.cpu().item(),
-                    "lr:",
-                    self.scheduler.get_lr()[0],
-                )
+                    'ite:', ite, 'total loss:', total_loss.cpu().item(), 'lr:',
+                    self.scheduler.get_lr()[0])
 
-            flags_log = os.path.join(flags.logs, "loss_log.txt")
-            write_log(str(total_loss.item()), flags_log)
+            flags_log = os.path.join(flags.logs, 'loss_log.txt')
+            write_log(
+                str(total_loss.item()),
+                flags_log)
 
             if ite % flags.test_every == 0 and ite is not 0:
-                self.test_workflow(flags, ite)
+                self.test_workflow(self.batImageGenVals, flags, ite)
 
-    def test_workflow(self, flags, ite):
+    def test_workflow(self, batImageGenVals, flags, ite):
 
-        acc_test = self.test(flags=flags, batImageGenTest=self.batImageGenTest)
-        self.best_accuracy = max(self.best_accuracy, acc_test)
+        accuracies = []
+        for count, batImageGenVal in enumerate(batImageGenVals):
+            accuracy_val = self.test(batImageGenTest=batImageGenVal, flags=flags, ite=ite,
+                                     log_dir=flags.logs, log_prefix='val_index_{}'.format(count))
 
-        f = open(os.path.join(flags.logs, "best_test.txt"), mode="a")
-        f.write(
-            "ite:{}, test accuracy:{} {}\n".format(
-                ite, acc_test, "best!" if acc_test == self.best_accuracy else ""
-            )
-        )
-        f.close()
+            accuracies.append(accuracy_val)
 
-        if not os.path.exists(flags.model_path):
-            os.makedirs(flags.model_path)
+        mean_acc = np.mean(accuracies)
 
-        outfile = os.path.join(flags.model_path, "best_model.tar")
-        torch.save({"ite": ite, "state": self.network.state_dict()}, outfile)
+        if mean_acc > self.best_accuracy_val:
+            self.best_accuracy_val = mean_acc
 
-    def test(self, flags, batImageGenTest):
+            acc_test = self.test(batImageGenTest=self.batImageGenTest, flags=flags, ite=ite,
+                                 log_dir=flags.logs, log_prefix='dg_test')
+
+            f = open(os.path.join(flags.logs, 'Best_val.txt'), mode='a')
+            f.write(
+                'ite:{}, best val accuracy:{}, test accuracy:{}\n'.format(ite, self.best_accuracy_val,
+                                                                          acc_test))
+            f.close()
+
+            if not os.path.exists(flags.model_path):
+                os.makedirs(flags.model_path)
+
+            outfile = os.path.join(flags.model_path, 'best_model.tar')
+            torch.save(
+                {'ite': ite, 'state': self.network.state_dict()}, outfile)
+
+    def bn_process(self, flags):
+        if flags.bn_eval == 1:
+            self.network.bn_eval()
+
+    def test(self, flags, ite, log_prefix, log_dir='logs/', batImageGenTest=None):
 
         # switch on the network test mode
         self.network.eval()
+
+        if batImageGenTest is None:
+            batImageGenTest = BatchImageGenerator(
+                flags=flags, file_path='', stage='test', b_unfold_label=True)
+
         images_test = batImageGenTest.images
         labels_test = batImageGenTest.labels
 
@@ -399,9 +363,9 @@ class ModelBaseline:
             indices_test = []
             for per_slice in range(n_slices_test - 1):
                 indices_test.append(
-                    int(len(images_test) * (per_slice + 1) / n_slices_test)
-                )
-            test_image_splits = np.split(images_test, indices_or_sections=indices_test)
+                    int(len(images_test) * (per_slice + 1) / n_slices_test))
+            test_image_splits = np.split(
+                images_test, indices_or_sections=indices_test)
 
             # Verify the splits are correct
             test_image_splits_2_whole = np.concatenate(test_image_splits)
@@ -410,197 +374,37 @@ class ModelBaseline:
             # split the test data into splits and test them one by one
             test_image_preds = []
             for test_image_split in test_image_splits:
-                images_test = Variable(
-                    torch.from_numpy(np.array(test_image_split, dtype=np.float32))
-                ).cuda()
+                images_test = Variable(torch.from_numpy(
+                    np.array(test_image_split, dtype=np.float32))).cuda()
                 tuples = self.network(images_test)
 
-                predictions = tuples[-1]["Predictions"]
+                predictions = tuples[-1]['Predictions']
                 predictions = predictions.cpu().data.numpy()
                 test_image_preds.append(predictions)
 
             # concatenate the test predictions first
             predictions = np.concatenate(test_image_preds)
         else:
-            images_test = Variable(
-                torch.from_numpy(np.array(images_test, dtype=np.float32))
-            ).cuda()
+            images_test = Variable(torch.from_numpy(
+                np.array(images_test, dtype=np.float32))).cuda()
             tuples = self.network(images_test)
 
-            predictions = tuples[-1]["Predictions"]
+            predictions = tuples[-1]['Predictions']
             predictions = predictions.cpu().data.numpy()
 
-        accuracy = compute_accuracy(predictions=predictions, labels=labels_test)
-        print("----------accuracy test----------:", accuracy)
+        accuracy = compute_accuracy(
+            predictions=predictions, labels=labels_test)
+        print('----------accuracy test----------:', accuracy)
+
+        if not os.path.exists(log_dir):
+            os.makedirs(log_dir)
+
+        f = open(os.path.join(log_dir, '{}.txt'.format(log_prefix)), mode='a')
+        f.write('ite:{}, accuracy:{}\n'.format(ite, accuracy))
+        f.close()
 
         # switch on the network train mode
         self.network.train()
+        self.bn_process(flags)
+
         return accuracy
-
-
-class ModelWDR(ModelBaseline):
-    def __init__(self, flags):
-        super(ModelWDR, self).__init__(flags)
-
-    def maximize(self, flags):
-        self.network.eval()
-
-        images_train, labels_train = (
-            self.batImageGenTrain.images,
-            self.batImageGenTrain.labels,
-        )
-        images, labels = [], []
-
-        for start, end in tqdm(
-            zip(
-                range(0, len(labels_train), flags.batch_size),
-                range(flags.batch_size, len(labels_train), flags.batch_size),
-            ),
-            total=len(
-                list(
-                    zip(
-                        range(0, len(labels_train), flags.batch_size),
-                        range(flags.batch_size, len(labels_train), flags.batch_size),
-                    )
-                )
-            ),
-            desc="Generating adversarial samples",
-        ):
-            inputs, targets = torch.from_numpy(
-                np.array(images_train[start:end], dtype=np.float32)
-            ), torch.from_numpy(np.array(labels_train[start:end], dtype=np.float32))
-
-            # wrap the inputs and labels in Variable
-            inputs, targets = (
-                Variable(inputs, requires_grad=False).cuda(),
-                Variable(targets, requires_grad=False).long().cuda(),
-            )
-            flags_log = os.path.join(flags.logs, "wdr.txt")
-            write_log(f"_" * 30, flags_log)
-            y = targets.repeat(flags.n_particles)
-
-            kernel = RBF(flags.n_particles)
-            batch_size, c, w, h = inputs.size()
-            # self.network.eval()
-            x_particle = inputs.repeat(flags.n_particles, 1, 1, 1)
-            with torch.no_grad():
-                y_pred = self.network(x=x_particle)[0]
-            x_adv = Variable(x_particle.data, requires_grad=True)
-            random_noise = flags.xi * torch.randn(x_adv.shape).to(inputs.device)
-
-            x_adv = Variable(
-                (x_adv.data + random_noise).detach().clone(), requires_grad=True
-            )
-            for ite_max in range(flags.loops_adv):
-                x_adv = x_adv.reshape(batch_size * flags.n_particles, -1)
-                x_adv.requires_grad_(True)
-                y_adv = self.network(
-                    x_adv.reshape(batch_size * flags.n_particles, c, w, h)
-                )[0]
-
-                if flags.loss_type == "pgd":
-                    loss_kl = nn.CrossEntropyLoss(size_average=False)(y_adv, y)
-                elif flags.loss_type == "trade":
-                    loss_kl = nn.KLDivLoss(size_average=False)(
-                        F.log_softmax(y_adv, dim=1),
-                        F.softmax(y_pred, dim=1),
-                    ) + nn.KLDivLoss(size_average=False)(
-                        F.log_softmax(y_pred, dim=1),
-                        F.softmax(y_adv, dim=1),
-                    )
-                else:
-                    raise ValueError(f"{flags.loss_type} is not supported")
-                write_log(
-                    f"|ite_adv:{ite_max:>3}| loss {loss_kl.item():.6f}|", flags_log
-                )
-
-                score_func = torch.autograd.grad(loss_kl, [x_adv])[0]
-                K_XX = kernel(x_adv, x_adv.detach())
-                grad_K = -torch.autograd.grad(K_XX.sum(), x_adv)[0]
-
-                phi = (K_XX.detach().matmul(score_func) + grad_K) / (
-                    batch_size * flags.n_particles
-                )
-                x_adv = (x_adv + flags.eps * torch.sign(phi)).detach()
-                x_adv = x_adv.reshape(batch_size * flags.n_particles, c, w, h)
-                x_adv = torch.min(
-                    torch.max(x_adv, x_particle - flags.xi), x_particle + flags.xi
-                )
-                x_adv = torch.clamp(x_adv, -2.64, 2.64).detach()
-                self.network.zero_grad()
-            images.append(x_adv.cpu().numpy())
-            labels.append(y.cpu().numpy())
-
-        self.network.train()
-        return np.concatenate(images), np.concatenate(labels)
-
-    def train(self, flags):
-        self.network.train()
-        # self.network.bn_eval()
-        self.best_accuracy = -1
-        counter_k = 0
-        for ite in range(flags.loops_train):
-            if ((ite + 1) % flags.loops_min == 0) and (
-                counter_k < flags.k
-            ):  # if T_min iterations are passed
-                print("Generating adversarial images [iter {}]".format(counter_k))
-                images, labels = self.maximize(flags)
-                self.batImageGenTrain.images = np.concatenate(
-                    (self.batImageGenTrain.images, images)
-                )
-                self.batImageGenTrain.labels = np.concatenate(
-                    (self.batImageGenTrain.labels, labels)
-                )
-                self.batImageGenTrain.shuffle()
-                counter_k += 1
-
-            self.network.train()
-            self.scheduler.step(epoch=ite)
-
-            # get the inputs and labels from the data reader
-            total_loss = 0.0
-
-            images_train, labels_train = self.batImageGenTrain.get_images_labels_batch()
-
-            inputs, labels = torch.from_numpy(
-                np.array(images_train, dtype=np.float32)
-            ), torch.from_numpy(np.array(labels_train, dtype=np.float32))
-
-            # wrap the inputs and labels in Variable
-            inputs, labels = (
-                Variable(inputs, requires_grad=False).cuda(),
-                Variable(labels, requires_grad=False).long().cuda(),
-            )
-
-            # forward with the adapted parameters
-            outputs, _ = self.network(x=inputs)
-
-            # loss
-            loss = self.loss_fn(outputs, labels)
-
-            total_loss += loss
-
-            # init the grad to zeros first
-            self.optimizer.zero_grad()
-
-            # backward your network
-            total_loss.backward()
-
-            # optimize the parameters
-            self.optimizer.step()
-
-            if ite < 500 or ite % 500 == 0:
-                print(
-                    "ite:",
-                    ite,
-                    "total loss:",
-                    total_loss.cpu().item(),
-                    "lr:",
-                    self.scheduler.get_lr()[0],
-                )
-
-            flags_log = os.path.join(flags.logs, "loss_log.txt")
-            write_log(str(total_loss.item()), flags_log)
-
-            if ite % flags.test_every == 0 and ite is not 0:
-                self.test_workflow(flags, ite)
